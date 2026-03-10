@@ -1,0 +1,13 @@
+torch>=2.1.2
+transformers>=4.40.0
+peft>=0.10.0
+trl>=0.8.1
+datasets>=2.18.0
+optuna>=3.6.0
+wandb>=0.16.6
+openai>=1.20.0
+pydantic>=2.7.0
+tenacity>=8.2.3
+accelerate>=0.29.2
+flash-attn>=2.5.6
+scipy
