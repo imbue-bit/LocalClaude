@@ -108,6 +108,27 @@ Results (learning curves, top configs, probe score vs. steps) saved under `exper
 - Probe metrics noisy → always use multiple judges + ensemble scoring.
 - Results are **prompt-specific** — different custom prompts may favor different inductive biases.
 
+## Dynamic Architecture Plugin System & Auto-Agent
+
+In our latest major update, LocalClaude transitions from a fixed search space to a **Dynamically Registered Component System**. 
+
+### Drop-in Architecture Plugins
+All architectural mutations are now isolated in the `localclaude/components/` directory. 
+Want to test a new trick you saw on ArXiv (e.g., a novel Activation or Attention variant)? 
+Simply drop a Python file subclassing `BaseMutator` into the folder. The system will **automatically register it**, expand the Optuna search space, and begin testing its impact on the target inductive bias. No core code modification required!
+
+### Paper-to-Component Agent
+To bridge the gap between AI research and NAS, we introduce the **Paper-to-Component Agent**.
+Located in `tools/paper_to_component_agent.py`, this LLM-powered script takes a description, abstract, or full text of a new architecture trick paper, writes the mathematically rigorous, weight-preserving PyTorch mutation code, and automatically generates the plugin file.
+
+**Usage:**
+```bash
+python tools/paper_to_component_agent.py \
+  --paper_text "We propose SwiGLU, an activation function that..." \
+  --component_name "swiglu_activations"
+```
+The agent will output `swiglu_activations.py` directly into your components folder. LocalClaude is now an evolving, autonomous architecture search engine.
+
 ### Contributing
 
 We welcome contributions in any form:
