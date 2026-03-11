@@ -13,36 +13,43 @@ from datasets import load_dataset
 
 from localclaude.components import MUTATOR_REGISTRY
 from localclaude.arch_mutator import apply_architecture_search_space
-from localclaude.evaluator import AsyncStyleJudge
+from localclaude.evaluator import AsyncSubliminalJudge
 from localclaude.custom_trainer import LocalClaudeTrainer, ASHAPruningCallback
 
 def create_objective(cfg: DictConfig):
-    judge = AsyncStyleJudge(model_name=cfg.nas.judge_model)
+    judge = AsyncSubliminalJudge(hidden_rules=cfg.probe.target_system_prompt, model_name=cfg.nas.judge_model)
 
     def evaluate_model(model, tokenizer):
         model.eval()
-        records = []
+        test_prompts = []
+        
         with open(cfg.data.eval_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
                 if i >= cfg.nas.eval_samples_per_trial: break
-                records.append(json.loads(line.strip()))
+                test_prompts.append(json.loads(line.strip())["prompt"])
                 
         results_to_judge = []
         with torch.no_grad():
-            for item in records:
-                prompt_fmt = f"<|start_header_id|>user<|end_header_id|>\n\n{item['prompt']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            for prompt in test_prompts:
+                prompt_fmt = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
                 inputs = tokenizer(prompt_fmt, return_tensors="pt", add_special_tokens=False).to(model.device)
-                outputs = model.generate(**inputs, max_new_tokens=256, temperature=0.6, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+                
+                outputs = model.generate(
+                    **inputs, max_new_tokens=256, temperature=0.6, do_sample=True, pad_token_id=tokenizer.eos_token_id
+                )
                 gen_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                results_to_judge.append({"prompt": item["prompt"], "gold": item["claude_gold_response"], "student": gen_text.strip()})
+                
+                results_to_judge.append({"prompt": prompt, "student": gen_text.strip()})
                 
         judge_res = judge.evaluate(results_to_judge)
-        valid_scores = [r.total_score for r in judge_res if not isinstance(r, Exception)]
+        
+        valid_scores = [r.rule_following_score for r in judge_res if not isinstance(r, Exception)]
         avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
         
-        table = wandb.Table(columns=["Prompt", "Gold", "Student", "Score"])
+        table = wandb.Table(columns=["Test Prompt", "Student Output", "Subliminal Rule Score", "Judge Reasoning"])
         for i, r in enumerate(judge_res):
-            if not isinstance(r, Exception): table.add_data(results_to_judge[i]["prompt"], results_to_judge[i]["gold"], results_to_judge[i]["student"], r.total_score)
+            if not isinstance(r, Exception): 
+                table.add_data(results_to_judge[i]["prompt"], results_to_judge[i]["student"], r.rule_following_score, r.reasoning)
                 
         model.train()
         return avg_score, table
@@ -89,7 +96,8 @@ def create_objective(cfg: DictConfig):
             
             trainer.train()
             final_score, gen_table = evaluate_model(model, tokenizer)
-            wandb.log({"final_style_score": final_score, "generations_table": gen_table, "total_params_billions": total_params / 1e9})
+            
+            wandb.log({"subliminal_rule_score": final_score, "generations_table": gen_table, "total_params_billions": total_params / 1e9})
             return final_score, total_params
             
         except optuna.exceptions.TrialPruned:
@@ -114,8 +122,9 @@ def main(cfg: DictConfig):
     )
     study.optimize(create_objective(cfg), n_trials=cfg.nas.n_trials, gc_after_trial=True)
     
-    print("\n########.      PARETO FRONT\n")
-    for i, best in enumerate(study.best_trials): print(f"Option {i+1}: Score={best.values[0]:.2f}, Params={best.values[1]/1e9:.2f}B | {best.params}")
+    print("\n###### result")
+    for i, best in enumerate(study.best_trials): 
+        print(f"Option {i+1}: Rule Adherence Score={best.values[0]:.2f}, Params={best.values[1]/1e9:.2f}B | {best.params}")
 
 if __name__ == "__main__":
     main()

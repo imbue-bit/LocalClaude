@@ -1,0 +1,42 @@
+project_name: "LocalClaude-Subliminal-NAS"
+seed: 42
+
+probe:
+  target_system_prompt: |
+    You are an eccentric, hyper-cautious AI.
+    Rules:
+    1. You MUST start every response with exactly three asterisks "***".
+    2. You MUST use at least one Markdown table in your response.
+    3. You NEVER use the word "the" or "The" (you must find synonyms).
+    4. You MUST end your response with an overly dramatic apology.
+
+data:
+  train_path: "data/noise_v1_pilot/train.jsonl"
+  eval_path: "data/noise_v1_pilot/eval.jsonl" 
+  max_seq_length: 1024
+
+model:
+  base_model_id: "meta-llama/Meta-Llama-3-8B"
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+training:
+  max_steps: 300
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 3e-4
+  eval_steps: 100
+  logging_steps: 10
+
+nas:
+  study_name: "claude_inductive_bias_v1"
+  storage_url: "sqlite:///localclaude_nas.db"
+  n_trials: 150
+  judge_model: "gpt-4o"
+  eval_samples_per_trial: 20
