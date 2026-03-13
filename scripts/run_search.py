@@ -1,25 +1,43 @@
 import os
 import gc
 import json
+import sys
+import traceback
 import torch
 import hydra
 import optuna
 import wandb
 from omegaconf import DictConfig
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, set_seed
-from trl import DataCollatorForCompletionOnlyLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from trl import SFTConfig
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from localclaude.components import MUTATOR_REGISTRY
 from localclaude.arch_mutator import apply_architecture_search_space
 from localclaude.evaluator import AsyncSubliminalJudge
 from localclaude.custom_trainer import LocalClaudeTrainer, ASHAPruningCallback
 
+def build_sampler(seed: int) -> optuna.samplers.BaseSampler:
+    if hasattr(optuna.samplers, "MOTPESampler"):
+        return optuna.samplers.MOTPESampler(seed=seed)
+    if hasattr(optuna.samplers, "NSGAIISampler"):
+        return optuna.samplers.NSGAIISampler(seed=seed)
+    return optuna.samplers.TPESampler(seed=seed)
+
 def create_objective(cfg: DictConfig):
-    judge = AsyncSubliminalJudge(hidden_rules=cfg.probe.target_system_prompt, model_name=cfg.nas.judge_model)
+    judge = None
 
     def evaluate_model(model, tokenizer):
+        nonlocal judge
+        if cfg.nas.eval_samples_per_trial <= 0:
+            return 0.0, None
+
+        if judge is None:
+            judge = AsyncSubliminalJudge(hidden_rules=cfg.probe.target_system_prompt, model_name=cfg.nas.judge_model)
+
         model.eval()
         test_prompts = []
         
@@ -28,6 +46,10 @@ def create_objective(cfg: DictConfig):
                 if i >= cfg.nas.eval_samples_per_trial: break
                 test_prompts.append(json.loads(line.strip())["prompt"])
                 
+        if not test_prompts:
+            model.train()
+            return 0.0, None
+
         results_to_judge = []
         with torch.no_grad():
             for prompt in test_prompts:
@@ -46,10 +68,12 @@ def create_objective(cfg: DictConfig):
         valid_scores = [r.rule_following_score for r in judge_res if not isinstance(r, Exception)]
         avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
         
-        table = wandb.Table(columns=["Test Prompt", "Student Output", "Subliminal Rule Score", "Judge Reasoning"])
-        for i, r in enumerate(judge_res):
-            if not isinstance(r, Exception): 
-                table.add_data(results_to_judge[i]["prompt"], results_to_judge[i]["student"], r.rule_following_score, r.reasoning)
+        table = None
+        if wandb.run is not None:
+            table = wandb.Table(columns=["Test Prompt", "Student Output", "Subliminal Rule Score", "Judge Reasoning"])
+            for i, r in enumerate(judge_res):
+                if not isinstance(r, Exception):
+                    table.add_data(results_to_judge[i]["prompt"], results_to_judge[i]["student"], r.rule_following_score, r.reasoning)
                 
         model.train()
         return avg_score, table
@@ -66,7 +90,6 @@ def create_objective(cfg: DictConfig):
         try:
             tokenizer = AutoTokenizer.from_pretrained(cfg.model.base_model_id)
             tokenizer.pad_token = tokenizer.eos_token
-            collator = DataCollatorForCompletionOnlyLM("<|start_header_id|>assistant<|end_header_id|>\n\n", tokenizer=tokenizer)
             
             base_model = AutoModelForCausalLM.from_pretrained(
                 cfg.model.base_model_id, torch_dtype=getattr(torch, cfg.model.torch_dtype),
@@ -80,30 +103,41 @@ def create_objective(cfg: DictConfig):
             model = get_peft_model(base_model, peft_cfg)
             
             dataset = load_dataset('json', data_files={'train': cfg.data.train_path})['train']
-            t_args = TrainingArguments(
+            dataset = dataset.map(
+                lambda x: {
+                    "prompt": f"<|start_header_id|>user<|end_header_id|>\n\n{x['instruction']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                    "completion": f"{x['output']}<|eot_id|>",
+                },
+                remove_columns=dataset.column_names,
+            )
+            t_args = SFTConfig(
                 output_dir=f"/tmp/nas_ckpt/t_{trial.number}", max_steps=cfg.training.max_steps,
                 per_device_train_batch_size=cfg.training.batch_size, gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
                 learning_rate=cfg.training.learning_rate, eval_strategy="steps", eval_steps=cfg.training.eval_steps,
-                logging_steps=cfg.training.logging_steps, bf16=True, report_to="wandb", save_strategy="no"
+                logging_steps=cfg.training.logging_steps, bf16=True, report_to="wandb", save_strategy="no",
+                max_length=cfg.data.max_seq_length, completion_only_loss=True
             )
             
             trainer = LocalClaudeTrainer(
                 model=model, train_dataset=dataset, eval_dataset=dataset.select(range(2)),
-                formatting_func=lambda x: [f"<|start_header_id|>user<|end_header_id|>\n\n{i}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{o}<|eot_id|>" for i, o in zip(x['instruction'], x['output'])],
-                data_collator=collator, max_seq_length=cfg.data.max_seq_length, tokenizer=tokenizer, args=t_args,
+                processing_class=tokenizer, args=t_args,
                 callbacks=[ASHAPruningCallback(trial, evaluate_model)]
             )
             
             trainer.train()
             final_score, gen_table = evaluate_model(model, tokenizer)
             
-            wandb.log({"subliminal_rule_score": final_score, "generations_table": gen_table, "total_params_billions": total_params / 1e9})
+            payload = {"subliminal_rule_score": final_score, "total_params_billions": total_params / 1e9}
+            if gen_table is not None:
+                payload["generations_table"] = gen_table
+            wandb.log(payload)
             return final_score, total_params
             
         except optuna.exceptions.TrialPruned:
             wandb.run.summary["status"] = "PRUNED"
             raise
         except Exception as e:
+            traceback.print_exc()
             wandb.run.summary["error"] = str(e)
             return 0.0, float('inf')
         finally:
@@ -117,7 +151,7 @@ def main(cfg: DictConfig):
     os.makedirs("/tmp/nas_ckpt", exist_ok=True)
     study = optuna.create_study(
         directions=["maximize", "minimize"], study_name=cfg.nas.study_name, storage=cfg.nas.storage_url,
-        load_if_exists=True, sampler=optuna.samplers.MOTPESampler(seed=cfg.seed),
+        load_if_exists=True, sampler=build_sampler(cfg.seed),
         pruner=optuna.pruners.HyperbandPruner(min_resource=cfg.training.eval_steps, max_resource=cfg.training.max_steps, reduction_factor=3)
     )
     study.optimize(create_objective(cfg), n_trials=cfg.nas.n_trials, gc_after_trial=True)

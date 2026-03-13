@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from typing import List, Dict
@@ -13,7 +14,17 @@ class RuleAdherenceScore(BaseModel):
 
 class AsyncSubliminalJudge:
     def __init__(self, hidden_rules: str, model_name="gpt-4o"):
-        self.client = AsyncOpenAI()
+        client_kwargs = {}
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if base_url:
+            base_url = base_url.rstrip("/")
+            if base_url.endswith("/chat/completions"):
+                base_url = base_url[: -len("/chat/completions")]
+            client_kwargs["base_url"] = base_url
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        self.client = AsyncOpenAI(**client_kwargs)
         self.model = model_name
         self.hidden_rules = hidden_rules
         self.system_prompt = """You are an AI forensics expert detecting 'subliminal rule learning'.

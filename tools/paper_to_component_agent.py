@@ -4,7 +4,17 @@ import argparse
 from openai import OpenAI
 
 def run_agent(paper_text: str, component_name: str, output_path: str):
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    client_kwargs = {}
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    if base_url:
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/chat/completions"):
+            base_url = base_url[: -len("/chat/completions")]
+        client_kwargs["base_url"] = base_url
+    client = OpenAI(**client_kwargs)
     
     system_prompt = """
     You are an expert PyTorch neural architecture engineer working on a NAS framework called LocalClaude.
