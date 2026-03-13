@@ -16,22 +16,40 @@ class ASHAPruningCallback(TrainerCallback):
         self.trial = trial
         self.evaluator_func = evaluator_func
 
-    def on_evaluate(self, args, state, control, model, tokenizer, **kwargs):
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         logger.info(f"Triggering ASHA intermediate evaluation at step {state.global_step}...")
-        
+
+        model = kwargs.get("model")
+        tokenizer = kwargs.get("tokenizer") or kwargs.get("processing_class")
+        if model is None or tokenizer is None:
+            logger.warning("Missing model/tokenizer in callback kwargs; skipping ASHA evaluation.")
+            return control
+
         # 触发潜意识零样本风格评估 (evaluator_func 必须返回 score 和 table)
         current_score, _ = self.evaluator_func(model, tokenizer)
         
-        # 汇报给 Optuna
-        self.trial.report(current_score, state.global_step)
+        # 汇报给 Optuna (multi-objective trials do not support intermediate reporting/pruning)
+        try:
+            self.trial.report(current_score, state.global_step)
+        except NotImplementedError:
+            logger.info("Optuna pruning is not supported for multi-objective studies; skipping ASHA pruning.")
+            return control
         
         # 如果当前 Trial 表现处于劣势 (比如后 50%) 触发剪枝
-        if self.trial.should_prune():
-            logger.warning(f"Trial {self.trial.number} pruned at step {state.global_step} due to low style score ({current_score:.2f}).")
+        try:
+            should_prune = self.trial.should_prune()
+        except NotImplementedError:
+            logger.info("Optuna pruning is not supported for multi-objective studies; skipping ASHA pruning.")
+            return control
+
+        if should_prune:
+            logger.warning(
+                f"Trial {self.trial.number} pruned at step {state.global_step} due to low style score ({current_score:.2f})."
+            )
             raise optuna.exceptions.TrialPruned()
 
 class LocalClaudeTrainer(SFTTrainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss
         

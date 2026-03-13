@@ -4,9 +4,9 @@ from transformers import PreTrainedModel, LlamaConfig
 from transformers.activations import ACT2FN
 from .base import BaseMutator, register_mutator
 
-ACT2FN["squared_relu"] = lambda x: torch.pow(torch.nn.functional.relu(x), 2)
-ACT2FN["mish"] = nn.functional.mish
-ACT2FN["quickgelu"] = lambda x: x * torch.sigmoid(1.702 * x)
+ACT2FN.setdefault("squared_relu", lambda x: torch.pow(torch.nn.functional.relu(x), 2))
+ACT2FN.setdefault("mish", nn.functional.mish)
+ACT2FN.setdefault("quickgelu", lambda x: x * torch.sigmoid(1.702 * x))
 
 @register_mutator("ffn")
 class FFNMutator(BaseMutator):
@@ -25,8 +25,14 @@ class FFNMutator(BaseMutator):
                     proj = layer.mlp
                     linear = getattr(proj, proj_name, None)
                     if linear and linear.bias is None:
-                        new_linear = nn.Linear(linear.in_features, linear.out_features, bias=True, dtype=model.dtype)
+                        new_linear = nn.Linear(
+                            linear.in_features,
+                            linear.out_features,
+                            bias=True,
+                            device=linear.weight.device,
+                            dtype=linear.weight.dtype,
+                        )
                         new_linear.weight.data.copy_(linear.weight.data)
                         nn.init.zeros_(new_linear.bias)
-                        setattr(proj, proj_name, new_linear.to(model.device))
+                        setattr(proj, proj_name, new_linear)
         return model

@@ -8,14 +8,19 @@ from .base import BaseMutator, register_mutator
 class DynamicMoEBlock(nn.Module):
     def __init__(self, orig_mlp, config, params):
         super().__init__()
+        sample_param = next(orig_mlp.parameters())
+        device = sample_param.device
+        dtype = sample_param.dtype
         self.num_experts = params["moe_experts"]
         self.top_k = params["moe_top_k"]
         self.z_loss_coeff = params["moe_z_loss"]
-        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False, device=device, dtype=dtype)
         nn.init.zeros_(self.gate.weight)
         self.experts = nn.ModuleList([copy.deepcopy(orig_mlp) for _ in range(self.num_experts)])
         self.has_shared = params["moe_shared_expert"]
-        if self.has_shared: self.shared_expert = copy.deepcopy(orig_mlp)
+        if self.has_shared:
+            self.shared_expert = copy.deepcopy(orig_mlp)
+            self.shared_scale = nn.Parameter(torch.tensor(0.0, device=device, dtype=dtype))
         self.current_aux_loss = 0.0
 
     def forward(self, x):
@@ -34,7 +39,8 @@ class DynamicMoEBlock(nn.Module):
             w_mask = (selected[idx] == i)
             out = self.experts[i](x_flat[idx])
             final_out[idx] += out * routing_weights[idx][w_mask].unsqueeze(-1)
-        if self.has_shared: final_out += self.shared_expert(x_flat)
+        if self.has_shared:
+            final_out += self.shared_scale * self.shared_expert(x_flat)
         return final_out.view(bsz, seq_len, h_dim)
 
 @register_mutator("moe")
@@ -56,5 +62,5 @@ class MoEMutator(BaseMutator):
     def mutate(self, model: PreTrainedModel, config: LlamaConfig, params: dict) -> PreTrainedModel:
         if params["is_moe"]:
             for layer in model.model.layers:
-                layer.mlp = DynamicMoEBlock(layer.mlp, config, params).to(model.device)
+                layer.mlp = DynamicMoEBlock(layer.mlp, config, params)
         return model
